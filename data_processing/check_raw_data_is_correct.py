@@ -24,7 +24,9 @@ if __name__ == "__main__":
     # ####################################################################################################
     # Check all folders exist
     # ####################################################################################################
-    parent_dir = os.path.dirname(os.getcwd())
+    parent_dir = os.path.dirname(os.getcwd()) + "/Calving_Fronts_and_Where_to_Find_Them"
+    print(parent_dir)
+
     assert os.path.exists(os.path.join(parent_dir, "data_raw")), "There is no data_raw folder in the top layer of this project. " \
                                                                  "Please make sure, you downloaded the data and put it into a folder called " \
                                                                  "'data_raw' that is directly under your project folder."

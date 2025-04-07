@@ -37,6 +37,7 @@ class GlacierDataset(Dataset):
         else:
             # use already existing shuffle
             with open(os.path.join("data_processing", "data_splits", "shuffle_" + mode + ".txt"), "rb") as fp:
+                print(fp)
                 shuffle = pickle.load(fp)
                 # if lengths do not match, we need to create a new permutation
                 if len(shuffle) != len(self.imgs):

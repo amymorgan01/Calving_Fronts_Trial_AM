@@ -42,13 +42,19 @@ def main(hparams, run_number, running_mode):
     logger = TensorBoardLogger(tb_logs_dir, name="log", default_hp_metric=False)
     lr_monitor = LearningRateMonitor(logging_interval='step')
 
+    #amy added
+    accelerator = 'gpu' if torch.cuda.is_available() else 'cpu'
+    devices = 1 if torch.cuda.is_available() else None
+
     # if we have already trained this model take up the training at the last checkpoint
     if os.path.isfile(checkpoint_dir + "temporary.ckpt"):
         print("Taking up the training where it was left (temporary checkpoint)")
         trainer = Trainer(resume_from_checkpoint=checkpoint_dir + "temporary.ckpt",
                           callbacks=[early_stop_callback, checkpoint_callback, lr_monitor],
                           deterministic=True,
-                          gpus=1,  # Train on gpu
+                          #gpus=1,  # Train on gpu
+                          accelerator=accelerator, #amy added
+                          devices=devices, #amy added
                           gradient_clip_val=clip_norm,
                           logger=logger,
                           max_epochs=hparams.epochs)
@@ -60,7 +66,9 @@ def main(hparams, run_number, running_mode):
                                                  deterministic=True,
                                                  fast_dev_run=False,
                                                  flush_logs_every_n_steps=100,
-                                                 gpus=1,
+                                                 #gpus=1,
+                                                 accelerator=accelerator,
+                                                 devices=devices,
                                                  log_every_n_steps=1,
                                                  logger=logger,
                                                  max_epochs=1000,
@@ -72,7 +80,9 @@ def main(hparams, run_number, running_mode):
                                                  deterministic=True,
                                                  fast_dev_run=3,
                                                  flush_logs_every_n_steps=100,
-                                                 gpus=1,
+                                                 #gpus=1,
+                                                 accelerator=accelerator,
+                                                 devices=devices,
                                                  log_every_n_steps=1,
                                                  logger=logger)
         elif running_mode == "training":
@@ -80,7 +90,9 @@ def main(hparams, run_number, running_mode):
             trainer = Trainer.from_argparse_args(hparams,
                                                  callbacks=[early_stop_callback, checkpoint_callback, lr_monitor],
                                                  deterministic=True,
-                                                 gpus=1,  # Train on gpu
+                                                 #gpus=1,  # Train on gpu
+                                                 accelerator=accelerator,
+                                                 devices=devices,
                                                  gradient_clip_val=clip_norm,
                                                  logger=logger,
                                                  max_epochs=hparams.epochs)
@@ -110,7 +122,15 @@ def main(hparams, run_number, running_mode):
                                             flip=hparams.flip)
         model = FrontUNet(vars(hparams))
 
-    summary(model.cuda(), (1, 256, 256))
+    #summary(model.cuda(), (1, 256, 256)) #amy added
+    # Check if CUDA is available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Move the model to the appropriate device
+    model = model.to(device)
+
+# Print the model summary
+    summary(model, (1, 256, 256))
     print(model.eval())
 
     trainer.fit(model, datamodule=datamodule)

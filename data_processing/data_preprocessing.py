@@ -95,7 +95,7 @@ def preprocess(modality_dir, data_split_dir, files, patch_size, overlap):
     :param overlap: number of pixels that the patches shall overlap
     :return:
     """
-    parent_dir = os.path.dirname(os.getcwd())
+    parent_dir = os.path.dirname(os.getcwd()) + "/Calving_Fronts_and_Where_to_Find_Them"
     for file in files:
         print(file)
         image = cv2.imread(file.__str__(), cv2.IMREAD_GRAYSCALE)
@@ -142,7 +142,7 @@ def main(raw_data_dir, patch_size, overlap, overlap_test, overlap_val):
     :param overlap_val: number of pixels that the validation patches shall overlap
     :return:
     """
-    parent_dir = os.path.dirname(os.getcwd())
+    parent_dir = os.path.dirname(os.getcwd()) + "/Calving_Fronts_and_Where_to_Find_Them"
     threads = []
     for modality_dir in ["sar_images", "zones", "fronts"]:
         if not os.path.exists(os.path.join(parent_dir, "data", modality_dir)):
@@ -214,7 +214,7 @@ if __name__ == '__main__':
     parser.add_argument('--overlap_val', default=128, help="The overlap in the sliding window approach (patch extraction) for validation data.")
     hparams = parser.parse_args()
 
-    parent_dir = os.path.dirname(os.getcwd())
+    parent_dir = os.path.dirname(os.getcwd()) + "/Calving_Fronts_and_Where_to_Find_Them"
 
     if not os.path.exists(os.path.join(parent_dir, "data")):
         os.makedirs(os.path.join(parent_dir, "data"))
