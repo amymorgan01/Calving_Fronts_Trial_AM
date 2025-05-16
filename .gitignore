@@ -8,3 +8,9 @@ test_results/
 validation_results/
 checkpoints/
 tb_logs/
+Changes/
+old_runs/
+results/
+wandb/
+segmentation_model_epoch_0.pth
+segmentation_model_latest.pth
