@@ -116,7 +116,12 @@ def analyze_dataset(data_dir, mode="train", threshold=0.8):
     print(f"  Max: {df['background_pct'].max():.4f}")
     print(f"  Mean: {df['background_pct'].mean():.4f}")
     print(f"  Median: {df['background_pct'].median():.4f}")
-        
+    
+    # Save results to CSV
+    output_csv = os.path.join(data_dir, f"{mode}_cleaned_patches.csv")
+    df.to_csv(output_csv, index=False)
+    print(f"\nAnalysis results saved to {output_csv}")
+
     return df
 
 
