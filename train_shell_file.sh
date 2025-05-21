@@ -6,7 +6,7 @@
 #SBATCH -n 5
 #SBATCH --job-name=CAFFE
 #SBATCH --qos=orchid
-#SBATCH --time=20:00:00
+#SBATCH --time=40:00:00
 #SBATCH -o %j.out
 #SBATCH -e %j.err
 #SBATCH --mem=64G

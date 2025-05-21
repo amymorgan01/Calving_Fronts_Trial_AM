@@ -7,6 +7,8 @@ import segmentation_models_pytorch as smp
 import tqdm
 import numpy as np
 import albumentations as A
+import pandas as pd
+
 
 class GlacierSegDataset(Dataset):
     """"
@@ -20,21 +22,46 @@ class GlacierSegDataset(Dataset):
     Args:
         - mode (str): 'train', 'val', or 'test'
         - parent_dir (str): Root directory containing 'sar_images', 'zones', and 'fronts' folders.
+        - label_type (str): 'mask' or 'front'
+        - bg_threshold (float): Maximum allowed background percentage (0-1.0), defaults to None (no filtering)
+        - /gws/nopw/j04/iecdt/amorgan/data_copy/train_cleaned_patches.csv is the csv file with filenames of non-blank images
+
     """
 
-    def __init__(self, mode, parent_dir, label_type = "mask"):
+    def __init__(self, mode, parent_dir, label_type = "mask", filtered_csv_path=None):
         print(f"Initializing GlacierSegDataset in {mode} mode...")
         self.label_type = label_type #choose between 'mask' and 'front'
+        
+        self.mode = mode
 
         self.image_dir = os.path.join(parent_dir, "sar_images", mode)
         self.mask_dir = os.path.join(parent_dir, "zones", mode)
         self.front_dir = os.path.join(parent_dir, "fronts", mode)
 
-        self.images = sorted(os.listdir(self.image_dir))
-        self.masks = sorted(os.listdir(self.mask_dir))
-        self.fronts = sorted(os.listdir(self.front_dir))
+        # Get all available files first
+        all_images = sorted(os.listdir(self.image_dir))
+        all_masks = sorted(os.listdir(self.mask_dir))
+        all_fronts = sorted(os.listdir(self.front_dir))
+
+        self.images = all_images
+        self.masks = all_masks  
+        self.fronts = all_fronts
+
         print(f"Number of images: {len(self.images)}, masks: {len(self.masks)}, fronts: {len(self.fronts)}")
         assert len(self.images) == len(self.masks) == len(self.fronts), "Mismatch in dataset size!"
+
+         # Load filtered filenames from CSV if specified
+        if filtered_csv_path is not None and os.path.exists(filtered_csv_path):
+            print(f"Loading filtered filenames from {filtered_csv_path}...")
+            self.images, self.masks, self.fronts = self._load_filtered_filenames_from_csv(
+                filtered_csv_path, all_images, all_masks, all_fronts
+            )
+            print(f"After filtering - images: {len(self.images)}, masks: {len(self.masks)}, fronts: {len(self.fronts)}")
+        else:
+            print(f"No CSV file specified or found. Using all available images.")
+            self.images = all_images
+            self.masks = all_masks
+            self.fronts = all_fronts
 
         # Use Albumentations for consistent transformations
         self.transform = A.Compose([
@@ -56,6 +83,117 @@ class GlacierSegDataset(Dataset):
         # self.l1 = np.isclose(0.2509804, 0.2509804, atol=1e-5)
         # self.l2 = np.isclose(0.49803922, 0.49803922, atol=1e-5)
         # self.l3 = np.isclose(0.99607843, 0.99607843, atol=1e-5)
+
+
+    def _load_filtered_filenames_from_csv(self, csv_path, all_images, all_masks, all_fronts):
+        """
+        Loads filtered filenames from a CSV file.
+        
+        The CSV should contain at least one of these columns:
+        - 'image_name': Filenames of filtered images
+        - 'is_bg_heavy': boolean indicating if the image is background dominated
+        
+        Args:
+            csv_path (str): Path to the CSV file
+            all_images (list): List of all image filenames
+            all_masks (list): List of all mask filenames
+            all_fronts (list): List of all front filenames
+            
+        Returns:
+            tuple: (filtered_images, filtered_masks, filtered_fronts)
+        """
+        try:
+            # Load the CSV file
+            df = pd.read_csv(csv_path)
+            
+            if 'is_bg_heavy' in df.columns:
+                #keep only images not dominated by background
+                df = df[df['is_bg_heavy'] == False]
+                print(f"After is_bg_heavy filtering: {len(df)} rows remaining")
+            
+            # Check which columns are present
+            has_image_col = 'image_name' in df.columns
+            has_mask_col = 'mask_name' in df.columns
+            has_front_col = 'front_name' in df.columns
+            
+            # Initialize filtered lists
+            filtered_images = []
+            filtered_masks = []
+            filtered_fronts = []
+            
+            if has_image_col:
+                # Filter based on image names in CSV
+                filtered_images = df['image_name'].tolist()
+                
+                # If mask or front columns are not in CSV, match them by index
+                if not has_mask_col or not has_front_col:
+                    # Create dictionaries to map image names to corresponding mask/front names
+                    image_to_mask = {img: mask for img, mask in zip(all_images, all_masks)}
+                    image_to_front = {img: front for img, front in zip(all_images, all_fronts)}
+                    
+                    if not has_mask_col:
+                        # For each filtered image, find corresponding mask
+                        filtered_masks = [image_to_mask[img] for img in filtered_images if img in image_to_mask]
+                    else:
+                        filtered_masks = df['mask_name'].tolist()
+                        
+                    if not has_front_col:
+                        # For each filtered image, find corresponding front
+                        filtered_fronts = [image_to_front[img] for img in filtered_images if img in image_to_front]
+                    else:
+                        filtered_fronts = df['front_name'].tolist()
+                else:
+                    # If all columns are present, use them directly
+                    filtered_masks = df['mask_name'].tolist()
+                    filtered_fronts = df['front_name'].tolist()
+            else:
+                # If no image column, check for mask column
+                if has_mask_col:
+                    filtered_masks = df['mask_name'].tolist()
+                    
+                    # Map masks to corresponding images and fronts
+                    mask_to_image = {mask: img for img, mask in zip(all_images, all_masks)}
+                    mask_to_front = {mask: front for mask, front in zip(all_masks, all_fronts)}
+                    
+                    filtered_images = [mask_to_image[mask] for mask in filtered_masks if mask in mask_to_image]
+                    
+                    if not has_front_col:
+                        filtered_fronts = [mask_to_front[mask] for mask in filtered_masks if mask in mask_to_front]
+                    else:
+                        filtered_fronts = df['front_name'].tolist()
+                elif has_front_col:
+                    # If only front column exists
+                    filtered_fronts = df['front_name'].tolist()
+                    
+                    # Map fronts to corresponding images and masks
+                    front_to_image = {front: img for img, front in zip(all_images, all_fronts)}
+                    front_to_mask = {front: mask for mask, front in zip(all_masks, all_fronts)}
+                    
+                    filtered_images = [front_to_image[front] for front in filtered_fronts if front in front_to_image]
+                    filtered_masks = [front_to_mask[front] for front in filtered_fronts if front in front_to_mask]
+                else:
+                    raise ValueError("CSV must contain at least one of 'image_name', 'mask_name', or 'front_name' columns")
+            
+            # Verify we have matching counts
+            if len(filtered_images) != len(filtered_masks) or len(filtered_images) != len(filtered_fronts):
+                print(f"Warning: Mismatch in filtered dataset counts - images: {len(filtered_images)}, masks: {len(filtered_masks)}, fronts: {len(filtered_fronts)}")
+                
+                # Find the smallest common set
+                common_size = min(len(filtered_images), len(filtered_masks), len(filtered_fronts))
+                filtered_images = filtered_images[:common_size]
+                filtered_masks = filtered_masks[:common_size]
+                filtered_fronts = filtered_fronts[:common_size]
+                
+                print(f"Truncated to common size: {common_size}")
+            
+            print(f"Loaded {len(filtered_images)} filtered images from CSV")
+            return filtered_images, filtered_masks, filtered_fronts
+            
+        except Exception as e:
+            print(f"Error loading filtered filenames from CSV: {e}")
+            print("Using all images without filtering.")
+            return all_images, all_masks, all_fronts
+    
 
     def convert_label(self, label_tensor):
         """

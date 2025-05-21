@@ -9,16 +9,19 @@ import cv2
 from dataset_class import GlacierSegDataset  # Your dataset class
 
 # Set paths
-model_path = '/home/users/amorgan/Calving_Fronts_and_Where_to_Find_Them/segmentation_model_epoch_0.pth'
+model_path = '/gws/nopw/j04/iecdt/amorgan/trained_models/seg_model_w_bkgrd_bs4_end.pth'
 parent_dir = "/gws/nopw/j04/iecdt/amorgan/data_copy"  # Update with your data pathls
-
 output_dir = '/home/users/amorgan/Calving_Fronts_and_Where_to_Find_Them/results'
 
 # Create output directory if it doesn't exist
 os.makedirs(output_dir, exist_ok=True)
 
+CLASS_NAMES = ["Background", "Rock", "Glacier", "Ocean&Ice"]
+N_CLASSES = len(CLASS_NAMES)
+COLORMAP = plt.cm.get_cmap('viridis', N_CLASSES)
+
 # Function to visualize predictions
-def visualize_prediction(image, mask, pred, save_path=None):
+def visualize_prediction(image, mask, pred, class_names=None, save_path=None):
     """
     Visualize the original image, ground truth mask, and prediction
     Args:
@@ -45,13 +48,13 @@ def visualize_prediction(image, mask, pred, save_path=None):
         image = image.squeeze(0)
     
     # Handle mask - it has shape [1, 4, 256, 256] or [4, 256, 256]
-    # First remove batch dimension if present
-    if len(mask.shape) == 4:  # [1, 4, H, W]
-        mask = mask.squeeze(0)  # Now it's [4, H, W]
+    # # First remove batch dimension if present
+    # if len(mask.shape) == 4:  # [1, 4, H, W]
+    #     mask = mask.squeeze(0)  # Now it's [4, H, W]
     
-    # Convert from one-hot encoding to class indices
-    if mask.shape[0] == 4:  # One-hot encoded mask [4, H, W]
-        mask = np.argmax(mask, axis=0)  # Now it's [H, W]
+    # # Convert from one-hot encoding to class indices
+    # if mask.shape[0] == 4:  # One-hot encoded mask [4, H, W]
+    #     mask = np.argmax(mask, axis=0)  # Now it's [H, W]
 
     # Denormalize image (if needed)
     mean = 0.3047126829624176
@@ -63,9 +66,9 @@ def visualize_prediction(image, mask, pred, save_path=None):
     
     # Create figure
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    if mask.shape[0] == 4 and len(mask.shape) == 3:
-    # Convert from one-hot [4, H, W] back to class indices [H, W]
-        mask_display = np.argmax(mask, axis=0)
+    # if mask.shape[0] == 4 and len(mask.shape) == 3:
+    # # Convert from one-hot [4, H, W] back to class indices [H, W]
+    #     mask_display = np.argmax(mask, axis=0)
 
     # Plot original image
     axes[0].imshow(image, cmap='gray')
@@ -75,15 +78,23 @@ def visualize_prediction(image, mask, pred, save_path=None):
     # Plot ground truth mask
     # For multi-class segmentation, use a colormap
     
-    axes[1].imshow(mask, cmap='viridis')
+    axes[1].imshow(mask, cmap=COLORMAP, vmin=0, vmax=N_CLASSES-1)
     axes[1].set_title('Ground Truth Mask')
     axes[1].axis('off')
     
     # Plot prediction
     # For prediction, we get class with highest probability
-    axes[2].imshow(pred, cmap='viridis')
+    axes[2].imshow(pred, cmap=COLORMAP, vmin=0, vmax=N_CLASSES-1)
     axes[2].set_title('Prediction')
     axes[2].axis('off')
+
+    if class_names:
+            import matplotlib.patches as mpatches
+            patches = []
+            for i, name in enumerate(class_names):
+                color = COLORMAP(i / (N_CLASSES-1))
+                patches.append(mpatches.Patch(color=color, label=name))
+            fig.legend(handles=patches, loc='lower center', ncol=N_CLASSES)
     
     plt.tight_layout()
     
@@ -93,7 +104,7 @@ def visualize_prediction(image, mask, pred, save_path=None):
     else:
         plt.show()
     
-    plt.close()
+    plt.close(fig)
 
 def get_colormap_for_segmentation(n_classes=4):
     """

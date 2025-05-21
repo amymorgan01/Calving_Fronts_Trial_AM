@@ -20,6 +20,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import random
 import cv2
 from sklearn.metrics import confusion_matrix
+import hydra
 
 
 # Set random seeds for reproducibility
@@ -264,18 +265,30 @@ def train_one_epoch(model, loader, criterion, optimizer, device, class_names=Non
     
     # Initialize metrics
     batch_count = len(loader)
-    class_iou_totals = torch.zeros(4).to(device)  # For 4 classes
-    confusion_matrix = torch.zeros((4, 4)).to(device)  # For 4 classes
+    all_preds = []
+    all_masks = []
+    # class_iou_totals = torch.zeros(4).to(device)  # For 4 classes
+    # confusion_matrix = torch.zeros((4, 4)).to(device)  # For 4 classes
 
-    # Initialize precision, recall, and F1 accumulators
-    precision_totals = torch.zeros(4).to(device)
-    recall_totals = torch.zeros(4).to(device)
-    f1_totals = torch.zeros(4).to(device)
-
+    # # Initialize precision, recall, and F1 accumulators
+    # precision_totals = torch.zeros(4).to(device)
+    # recall_totals = torch.zeros(4).to(device)
+    # f1_totals = torch.zeros(4).to(device)
+    pbar = tqdm.tqdm(enumerate(loader), total=len(loader))
+    
     if class_names is None:
         class_names = CONFIG["class_names"]
     
-    pbar = tqdm.tqdm(enumerate(loader), total=len(loader))
+    is_slurm = 'SLURM_JOB_ID' in os.environ
+    # if is_slurm:
+    #     loader_iter = enumerate(loader)
+    #     print(f"Running in SLURM environment. Total batches: {batch_count}")
+
+    # else:
+    #     loader_iter = tqdm.tqdm(enumerate(loader), total=batch_count)
+    
+    vis_interval = max(len(loader) - 1, 1)
+
     for i, (images, masks) in pbar:
         images = images.to(device)  # Shape: [batch_size, 1, height, width]
         masks = masks.to(device).long()  #squeeze 1 was causing issues
@@ -302,90 +315,92 @@ def train_one_epoch(model, loader, criterion, optimizer, device, class_names=Non
         else:
             # Standard training
             outputs = model(images)
-            masks = torch.nn.functional.one_hot(masks, num_classes=4).permute(0, 3, 1, 2)
+            masks_one_hot = torch.nn.functional.one_hot(masks, num_classes=4).permute(0, 3, 1, 2)
             # print("outputs shape:", outputs.shape)
             # print("masks shape (after forward):", masks.shape)
             # print("masks unique (after forward):", torch.unique(masks))
-            loss = criterion(outputs, masks)
+            loss = criterion(outputs, masks_one_hot)
             loss.backward()
-            
             if CONFIG["training"]["clip_grad_norm"] > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 
                                               max_norm=CONFIG["training"]["clip_grad_norm"])
-            
             optimizer.step()
         
         # Record the loss
         current_loss = loss.item()
         epoch_loss += current_loss
         batch_losses.append(current_loss)
-        
-        # Update progress bar
-        pbar.set_description(f"Epoch {epoch+1} | Loss: {current_loss:.4f}")
-     
 
-        # Calculate per-class metrics for monitoring
+        # Accumulate predictions and masks for metrics at the end of the epoch
         with torch.no_grad():
             # Get predicted class
             preds = torch.argmax(outputs, dim=1)  # [batch_size, H, W]
-            masks_flattened = torch.argmax(masks, dim=1)
+            # masks_flattened = torch.argmax(masks, dim=1)
+            all_preds.append(preds.cpu())
+            all_masks.append(masks.cpu())
 
-            batch_precision, batch_recall, batch_f1 = calculate_metrics(masks_flattened, preds, num_classes=4)
+            # batch_precision, batch_recall, batch_f1 = calculate_metrics(masks, preds, num_classes=4)
             
-            # Accumulate metrics
-            precision_totals += torch.tensor(batch_precision).to(device)
-            recall_totals += torch.tensor(batch_recall).to(device)
-            f1_totals += torch.tensor(batch_f1).to(device)
-            
-            # Calculate IoU for each class
-            for cls in range(4):
-                pred_cls = (preds == cls)
-                target_cls = (masks == cls)
-                
-                intersection = (pred_cls & target_cls).sum().float()
-                union = (pred_cls | target_cls).sum().float()
-                
-                iou = intersection / (union + 1e-8)
-                class_iou_totals[cls] += iou
-                
-                # Update confusion matrix
-                for true_cls in range(4):
-                    true_positive = ((masks == true_cls) & (preds == cls)).sum().item()
-                    confusion_matrix[true_cls, cls] += true_positive
-
-            # Visualize predictions (less frequently to save resources)
-            if i % 50 == 0:
-                # Select first image in batch for visualization
-                vis_fig = visualize_prediction(
-                    images[0], 
-                    masks_flattened[0], 
-                    preds[0], 
-                    class_names,
-                    sample_info=f"Epoch {epoch+1}, Batch {i}"
-                )
-                wandb.log({
-                    f"prediction_vis_epoch_{epoch}_batch_{i}": wandb.Image(vis_fig),
-                    "epoch": epoch,
-                    "batch": i
-                })
-                plt.close(vis_fig)
+            # precision_totals += torch.tensor(batch_precision).to(device)
+            # recall_totals += torch.tensor(batch_recall).to(device)
+            # f1_totals += torch.tensor(batch_f1).to(device)
 
         # Log batch-level metrics (less frequently to avoid too many logs)
-        if i % 10 == 0:  # Log every 10 batches
+        if i % 500 == 0:  # Log every 10 batches
             wandb.log({
                 "batch_loss": current_loss,
                 "batch": i + len(loader) * epoch,
                 "epoch": epoch,
                 "learning_rate": optimizer.param_groups[0]['lr']
-            })    
-
-    # Calculate epoch-level metrics
-    class_ious = class_iou_totals / batch_count
-    mean_iou = class_ious.mean().item()
+            }) 
+        
+        if i == vis_interval:
+                vis_fig = visualize_prediction(
+                    images[0], 
+                    masks[0],
+                    preds[0], 
+                    class_names,
+                    sample_info=f"Epoch {epoch+1}, Final Batch"
+                )
+                wandb.log({
+                    f"prediction_vis_epoch_{epoch}": wandb.Image(vis_fig),
+                    "epoch": epoch
+                })
+                plt.close(vis_fig)
+        
+        if is_slurm and (i % 500 == 0 or i == batch_count -1):
+                print(f"Epoch {epoch+1} | Batch {i+1}/{batch_count} | Loss: {loss.item():.4f}")
     
-    avg_precision = precision_totals / batch_count
-    avg_recall = recall_totals / batch_count
-    avg_f1 = f1_totals / batch_count
+    
+    all_preds = torch.cat(all_preds, dim=0)
+    all_masks = torch.cat(all_masks, dim=0)
+
+    # Calculate metrics ONCE at the end of the epoch
+    precision, recall, f1 = calculate_metrics(all_masks, all_preds, num_classes=4)
+    # Calculate IoU for each class
+    class_ious = []
+    for cls in range(4):
+        pred_cls = (preds == cls)
+        target_cls = (masks == cls)
+        intersection = (pred_cls & target_cls).sum().float()
+        union = (pred_cls | target_cls).sum().float()
+        iou = intersection / (union + 1e-8)
+        # class_iou_totals[cls] += iou
+        class_ious.append(iou.item())
+    class_ious = np.array(class_ious)
+    mean_iou = class_ious.mean()           
+                # # Update confusion matrix
+                # for true_cls in range(4):
+                #     true_positive = ((masks == true_cls) & (preds == cls)).sum().item()
+                #     confusion_matrix[true_cls, cls] += true_positive
+
+    # # Calculate epoch-level metrics
+    # class_ious = class_iou_totals / batch_count
+    # mean_iou = class_ious.mean().item()
+    
+    # avg_precision = precision_totals / batch_count
+    # avg_recall = recall_totals / batch_count
+    # avg_f1 = f1_totals / batch_count
     
     # Plot batch losses within epoch
     batch_loss_fig = plt.figure(figsize=(10, 5))
@@ -401,18 +416,18 @@ def train_one_epoch(model, loader, criterion, optimizer, device, class_names=Non
         "train_loss": epoch_loss / len(loader),
         "mean_iou": mean_iou,
         "batch_losses": wandb.Image(batch_loss_fig),
-        "mean_precision": avg_precision.mean().item(),
-        "mean_recall": avg_recall.mean().item(),
-        "mean_f1": avg_f1.mean().item(),
+        "mean_precision": precision.mean(),
+        "mean_recall": recall.mean(),
+        "mean_f1": f1.mean(),
         "epoch": epoch
     }
     
     # Add per-class IoUs
     for i, class_name in enumerate(class_names):
-        metrics[f"iou_{class_name}"] = class_ious[i].item()
-        metrics[f"precision_{class_name}"] = avg_precision[i].item()
-        metrics[f"recall_{class_name}"] = avg_recall[i].item()
-        metrics[f"f1_{class_name}"] = avg_f1[i].item()
+        metrics[f"train_iou_{class_name}"] = class_ious[i]
+        metrics[f"train_precision_{class_name}"] = precision[i]
+        metrics[f"train_recall_{class_name}"] = recall[i]
+        metrics[f"train_f1_{class_name}"] = f1[i]
     
     wandb.log(metrics)
     plt.close(batch_loss_fig)
@@ -420,99 +435,152 @@ def train_one_epoch(model, loader, criterion, optimizer, device, class_names=Non
     
     return epoch_loss / len(loader)
 
-def validate(model, loader, criterion, device, class_names=None, epoch=0):
+def validate(model, loader, criterion, device, class_names=None, epoch=0, scaler=None):
     model.eval()
     val_loss = 0
+    vis_batch = len(loader) - 1
     
     # Initialize metrics
     batch_count = len(loader)
-    class_iou_totals = torch.zeros(4).to(device)
-    precision_totals = torch.zeros(4).to(device)
-    recall_totals = torch.zeros(4).to(device)
-    f1_totals = torch.zeros(4).to(device)
+    all_preds = []
+    all_masks = []
+    # class_iou_totals = torch.zeros(4).to(device)
+    # precision_totals = torch.zeros(4).to(device)
+    # recall_totals = torch.zeros(4).to(device)
+    # f1_totals = torch.zeros(4).to(device)
+    # confusion_matrix = torch.zeros((4, 4)).to(device)  # For 4 classes
     
     if class_names is None:
         class_names = CONFIG["class_names"]
         
     print(f"Running validation for epoch {epoch+1}...")
     
-    with torch.no_grad():
+    is_slurm = 'SLURM_JOB_ID' in os.environ
+    if is_slurm:
+        loader_iter = enumerate(loader)
+        total_batches = len(loader)
+            # print(f"Running validation in SLURM environment. Total batches: {total_batches}")
+    else:
         pbar = tqdm.tqdm(enumerate(loader), total=len(loader))
-        for i, (images, masks) in pbar:
+        loader_iter = pbar
+
+    with torch.no_grad():
+        for i, (images, masks) in loader_iter:
             images = images.to(device)
             masks = masks.to(device).long()
             
             outputs = model(images)
-            loss = criterion(outputs, masks)
-            # val_loss += loss.item()
+            # loss = criterion(outputs, masks)
+            masks_one_hot = torch.nn.functional.one_hot(masks, num_classes=4).permute(0, 3, 1, 2)
+            loss = criterion(outputs, masks_one_hot)
+            val_loss += loss.item()
             
             # Get predicted class
             preds = torch.argmax(outputs, dim=1)
+            all_preds.append(preds.cpu())
+            all_masks.append(masks.cpu())
             
             # Calculate metrics for this batch
-            batch_precision, batch_recall, batch_f1 = calculate_metrics(masks, preds, num_classes=4)
-            precision_totals += torch.tensor(batch_precision).to(device)
-            recall_totals += torch.tensor(batch_recall).to(device)
-            f1_totals += torch.tensor(batch_f1).to(device)
-            
-            # Calculate IoU for each class
-            for cls in range(4):
-                pred_cls = (preds == cls)
-                target_cls = (masks == cls)
-                
-                intersection = (pred_cls & target_cls).sum().float()
-                union = (pred_cls | target_cls).sum().float()
-                
-                iou = intersection / (union + 1e-8)
-                class_iou_totals[cls] += iou
+            # batch_precision, batch_recall, batch_f1 = calculate_metrics(masks, preds, num_classes=4)
+            # precision_totals += torch.tensor(batch_precision).to(device)
+            # recall_totals += torch.tensor(batch_recall).to(device)
+            # f1_totals += torch.tensor(batch_f1).to(device)
             
             # Visualize some predictions
-            if i == 0:  # Just the first batch
-                for j in range(min(4, images.size(0))):
-                    vis_fig = visualize_prediction(
-                        images[j],
-                        masks[j],
-                        preds[j],
-                        class_names,
-                        sample_info=f"Validation - Epoch {epoch+1}"
-                    )
-                    wandb.log({
-                        f"val_pred_epoch_{epoch}_sample_{j}": wandb.Image(vis_fig),
-                        "epoch": epoch
-                    })
-                    plt.close(vis_fig)
+            if i == vis_batch:
+                sample_idx = 0
+                vis_fig = visualize_prediction(
+                    images[sample_idx],
+                    masks[sample_idx],
+                    preds[sample_idx],
+                    class_names,
+                    sample_info=f"Validation - Epoch {epoch+1}, Final"
+                )
+                wandb.log({
+                    f"val_pred_epoch_{epoch}": wandb.Image(vis_fig),
+                    "epoch": epoch
+                })
+                plt.close(vis_fig)
+            if is_slurm and i % 10 == 0:
+                print(f"Validation Epoch {epoch+1} | Batch {i}/{total_batches} | Loss: {loss.item():.4f}")
     
+    all_preds = torch.cat(all_preds, dim=0)
+    all_masks = torch.cat(all_masks, dim=0)
+    precision, recall, f1 = calculate_metrics(all_masks, all_preds, num_classes=4)
+    class_ious = []
     # Calculate average metrics
     # avg_val_loss = val_loss / batch_count
-    class_ious = class_iou_totals / batch_count
-    mean_iou = class_ious.mean().item()
+    # class_ious = class_iou_totals / batch_count
+    # mean_iou = class_ious.mean().item()
     
-    avg_precision = precision_totals / batch_count
-    avg_recall = recall_totals / batch_count
-    avg_f1 = f1_totals / batch_count
+    # avg_precision = precision_totals / batch_count
+    # avg_recall = recall_totals / batch_count
+    # avg_f1 = f1_totals / batch_count
+
+    # Calculate IoU for each class
+    for cls in range(4):
+        pred_cls = (preds == cls)
+        target_cls = (masks == cls)
+        intersection = (pred_cls & target_cls).sum().float()
+        union = (pred_cls | target_cls).sum().float()
+        iou = intersection / (union + 1e-8)
+        class_ious.append(iou.item())
+    class_ious = np.array(class_ious)
+    mean_iou = class_ious.mean()
+    avg_val_loss = val_loss / batch_count
+
+                # for true_cls in range(4):
+                #     true_positive = ((masks == true_cls) & (preds == cls)).sum().item()
+                #     confusion_matrix[true_cls, cls] += true_positive
     
-    # # Log validation metrics
-    # metrics = {
-    #     "val_loss": avg_val_loss,
-    #     "val_mean_iou": mean_iou,
-    #     "val_mean_precision": avg_precision.mean().item(),
-    #     "val_mean_recall": avg_recall.mean().item(),
-    #     "val_mean_f1": avg_f1.mean().item(),
-    #     "epoch": epoch
-    # }
+# Code for plotting confusion matrix
+
+    # conf_matrix_fig = plt.figure(figsize=(10, 8))
+    # conf_matrix_np = confusion_matrix.cpu().numpy()
+    # plt.imshow(conf_matrix_np, cmap='Blues')
+    # plt.colorbar()
+    # plt.title('Validation Confusion Matrix')
+    # plt.xlabel('Predicted')
+    # plt.ylabel('True')
+    # plt.xticks(range(4), class_names, rotation=45)
+    # plt.yticks(range(4), class_names)
+    
+    # # Add text annotations to the confusion matrix
+    # for i in range(4):
+    #     for j in range(4):
+    #         # Normalize by row (true class)
+    #         row_sum = conf_matrix_np[i].sum()
+    #         percentage = (conf_matrix_np[i, j] / row_sum) * 100 if row_sum > 0 else 0
+    #         plt.text(j, i, f'{percentage:.1f}%', ha='center', va='center', 
+    #                  color='white' if conf_matrix_np[i, j] > conf_matrix_np.max() / 2 else 'black')
+    
+    plt.tight_layout()
+
+    # Log validation metrics
+    metrics = {
+        "val_loss": avg_val_loss,
+        "val_mean_iou": mean_iou,
+        "val_mean_precision": precision.mean(),
+        "val_mean_recall": recall.mean(),
+        "val_mean_f1": f1.mean(),
+        # "val_confusion_matrix": wandb.Image(conf_matrix_fig),
+        "epoch": epoch
+    }
     
     # # Add per-class metrics
-    # for i, class_name in enumerate(class_names):
-    #     metrics[f"val_iou_{class_name}"] = class_ious[i].item()
-    #     metrics[f"val_precision_{class_name}"] = avg_precision[i].item() 
-    #     metrics[f"val_recall_{class_name}"] = avg_recall[i].item()
-    #     metrics[f"val_f1_{class_name}"] = avg_f1[i].item()
+    for i, class_name in enumerate(class_names):
+        metrics[f"val_iou_{class_name}"] = class_ious[i]
+        metrics[f"val_precision_{class_name}"] = precision[i]
+        metrics[f"val_recall_{class_name}"] = recall[i]
+        metrics[f"val_f1_{class_name}"] = f1[i]
     
-    # wandb.log(metrics)
+    wandb.log(metrics)
+    # plt.close(conf_matrix_fig)
+    plt.close('all')
     
-    return mean_iou
+    return avg_val_loss, mean_iou
 
-def calculate_class_weights(dataset, max_samples=1000, method='balanced'):
+def calculate_class_weights(dataset, max_samples=500, method='balanced'):
     print("Calculating class weights...")
     class_counts = torch.zeros(4)
     
@@ -580,34 +648,54 @@ def main():
         project="CAFFE",
         name="seg_improved_glacier",
         entity="amy-morgan-university-of-oxford",
+        settings=wandb.Settings(
+        start_method="thread"),
+        job_type="training",
+        save_code=False,
         config=CONFIG
     )
     
     class_names = CONFIG["class_names"]
     parent_dir = CONFIG["data"]["parent_dir"]
-    
+    filtered_csv_path = os.path.join(parent_dir, "train_cleaned_patches.csv")
+
+    #save the models to gws
+    save_dir = "/gws/nopw/j04/iecdt/amorgan/trained_models"
+    os.makedirs(save_dir, exist_ok=True)
+
     # Load datasets
-    train_dataset = GlacierSegDataset(mode='train', parent_dir=parent_dir, label_type="mask")
-    # val_dataset = GlacierSegDataset(mode='val', parent_dir=parent_dir, label_type="mask")
-    class_weights = class_weights  # Placeholder for testing
+    train_dataset = GlacierSegDataset(mode='train', parent_dir=parent_dir, label_type="mask",filtered_csv_path=filtered_csv_path)
+    val_dataset = GlacierSegDataset(mode='val', parent_dir=parent_dir, label_type="mask")
+    class_weights = calculate_class_weights(train_dataset, method=CONFIG["training"]["class_weight_method"])
+   
 
     # Create data loaders
     train_loader = DataLoader(
         train_dataset, 
         batch_size=CONFIG["training"]["batch_size"], 
         shuffle=True,
-        num_workers=4,
-        pin_memory=True
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True
     )
     
-    # Visualize class weights
-    plt.figure(figsize=(10, 5))
-    plt.bar(class_names, class_weights.numpy())
-    plt.title("Class Weights")
-    plt.ylabel("Weight Value")
-    plt.tight_layout()
-    wandb.log({"class_weights": wandb.Image(plt)})
-    plt.close()
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=CONFIG["training"]["batch_size"],
+        shuffle=False,
+        num_workers=8,
+        pin_memory=True,
+        persistent_workers=True
+    )
+
+    # # Visualize class weights
+    # plt.figure(figsize=(10, 5))
+    # plt.bar(class_names, class_weights.numpy())
+    # plt.title("Class Weights")
+    # plt.ylabel("Weight Value")
+    # plt.tight_layout()
+    # wandb.log({"class_weights": wandb.Image(plt)})
+    # plt.close()
     
     # Create model
     model = smp.Unet(
@@ -641,7 +729,13 @@ def main():
         eta_min=1e-6  # Minimum learning rate
     )
     patience_counter = 0
-    
+    best_val_loss = float('inf')
+    best_val_iou = 0.0
+    best_epoch = -1
+
+    # Add batch size to the model name
+    model_name_prefix = f"seg_model_bs{CONFIG['training']['batch_size']}"
+
     for epoch in range(CONFIG["training"]["epochs"]):
         # Train one epoch
         train_loss = train_one_epoch(
@@ -653,27 +747,112 @@ def main():
             class_names=class_names,
             epoch=epoch
         )
+        val_loss, val_iou = validate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            class_names=class_names,
+            epoch=epoch)
         
         # Update scheduler
         scheduler.step()
-
+        if CONFIG.get("use_wandb", False):
+            wandb.log({
+                "train_loss": train_loss,
+                "epoch": epoch
+            })
+        
+        if val_iou > best_val_iou:
+            best_val_iou = val_iou
+            best_val_loss = val_loss
+            best_epoch = epoch
+            best_model_path = os.path.join(save_dir, f"{model_name_prefix}_best.pth")
+            
+            # Save model checkpoint with more information
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'val_loss': val_loss,
+                'val_iou': val_iou,
+                'config': CONFIG
+            }, best_model_path)
+            
+            print(f"New best model saved at epoch {epoch+1} with val IoU: {val_iou:.4f} and val loss: {val_loss:.4f}")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            print(f"No improvement for {patience_counter} epochs. Best val IoU: {best_val_iou:.4f} at epoch {best_epoch+1}")
+        
         # Check for early stopping
         if patience_counter >= CONFIG["training"]["patience"]:
             print(f"Early stopping triggered after {epoch+1} epochs!")
             break
 
         if epoch % 50 == 0:
-            torch.save(model.state_dict(), f"segmentation_model_epoch_{epoch}.pth")
-        else:
-            torch.save(model.state_dict(), f"segmentation_model_latest.pth")
+            checkpoint_path = os.path.join(save_dir, f"{model_name_prefix}_epoch_{epoch}.pth")
+            torch.save(model.state_dict(), checkpoint_path)
+    
+        # Always save latest model with batch size in the name
+        latest_model_path = os.path.join(save_dir, f"{model_name_prefix}_latest.pth")
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+            'val_loss': val_loss,
+            'val_iou': val_iou,
+            'config': CONFIG
+        }, latest_model_path)
 
         # Clear memory
         torch.cuda.empty_cache()
         gc.collect()
+
+       # Final evaluation on validation set using best model
+    print(f"\n{'='*20} Final Evaluation {'='*20}")
+    print(f"Loading best model from epoch {best_epoch+1}")
+    
+    # Load the best model
+    checkpoint = torch.load(best_model_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Final validation
+    final_val_loss, final_val_iou = validate(
+        model,
+        val_loader,
+        criterion,
+        device,
+        class_names=class_names,
+        epoch=CONFIG["training"]["epochs"]  # Just for logging purposes
+    )
+    
+    # Log final results
+    final_metrics = {
+        "final_val_loss": final_val_loss,
+        "final_val_iou": final_val_iou,
+        "best_epoch": best_epoch + 1,
+        "best_val_loss": best_val_loss,
+        "best_val_iou": best_val_iou,
+        "total_epochs_trained": epoch + 1
+    }
+    wandb.log(final_metrics)
+    
+    # Print summary
+    print("\nTraining Summary:")
+    print(f"Total epochs trained: {epoch + 1}")
+    print(f"Best model at epoch {best_epoch + 1}")
+    print(f"Best validation IoU: {best_val_iou:.4f}")
+    print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Final validation IoU: {final_val_iou:.4f}")
+    print(f"Final validation loss: {final_val_loss:.4f}")
+    print(f"Best model saved at: {best_model_path}")
         
     wandb.finish()
-    print("Training completed!")
-
+   
+   
 def inference(model_path, image_path, device=None):
     """
     Run inference on a single image using a trained model.
@@ -860,6 +1039,7 @@ def evaluate_model(model_path, dataset, device=None):
     }
     
     return metrics
+
 
 # Main execution entry point
 if __name__ == "__main__":
