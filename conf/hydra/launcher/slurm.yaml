@@ -1,0 +1,14 @@
+defaults:
+  - submitit_slurm
+
+_target_: hydra_plugins.hydra_submitit_launcher.submitit_launcher.SlurmLauncher
+submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+timeout_min: 1439
+mem_gb: 40
+cpus_per_task: 8
+partition: orchid
+gres: gpu:4
+name: ${name}
+qos: orchid
+additional_parameters:
+  account: orchid

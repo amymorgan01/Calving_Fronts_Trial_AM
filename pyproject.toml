@@ -1,0 +1,24 @@
+[project]
+name = "glacier-seg"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "torch",
+    "pillow",
+    "tqdm",
+    "matplotlib",
+    "opencv-python",
+    "scikit-learn",
+    "hydra-core",
+    "wandb",
+    "monai",
+    "segmentation_models_pytorch",
+    "psutils",
+    "omegaconf",
+    "hydra-submitit-launcher>=1.2.0",
+    "pandas",
+    "albumentations",
+]
+

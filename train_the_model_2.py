@@ -21,7 +21,11 @@ import random
 import cv2
 from sklearn.metrics import confusion_matrix
 import hydra
-
+import logging
+from omegaconf import DictConfig, OmegaConf
+from loss_file import get_loss_function
+from epoch_train import train_one_epoch, validate, calculate_metrics
+from utils_AM import print_gpu_usage
 
 # Set random seeds for reproducibility
 def set_seed(seed=42):
@@ -31,563 +35,43 @@ def set_seed(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    #torch.backends.cudnn.deterministic = True
+    #torch.backends.cudnn.benchmark = False
 
-set_seed()
+# # Config dictionary - centralize all hyperparameters
+# CONFIG = {
+#     "model": {
+#         "encoder_name": "resnet50",  # Upgraded from resnet34
+#         "encoder_weights": "imagenet",
+#         "in_channels": 1,
+#         "classes": 4
+#     },
+#     "training": {
+#         "batch_size": 4,  # Increased from 4
+#         "learning_rate": 1e-4,  # Slightly higher initial LR with scheduler
+#         "weight_decay": 1e-4,
+#         "epochs": 50,  # Increased max epochs
+#         "patience": 8,  # Early stopping patience
+#         "class_weight_method": "balanced",  # Options: inverse, balanced, effective, capped
+#         "mixed_precision": True,  # Enable mixed precision training
+#         "clip_grad_norm": 1.0
+#     },
+#     "data": {
+#         "img_size": 256,  # Image size for training
+#         "augmentation_prob": 0.5,  # Probability of applying augmentations
+#         "parent_dir": "/gws/nopw/j04/iecdt/amorgan/data_copy"
+#     },
+#     "class_names": ["Background", "Rock", "Glacier", "Ocean&Ice"]
+# }
 
-# Config dictionary - centralize all hyperparameters
-CONFIG = {
-    "model": {
-        "encoder_name": "resnet50",  # Upgraded from resnet34
-        "encoder_weights": "imagenet",
-        "in_channels": 1,
-        "classes": 4
-    },
-    "training": {
-        "batch_size": 4,  # Increased from 4
-        "learning_rate": 1e-4,  # Slightly higher initial LR with scheduler
-        "weight_decay": 1e-4,
-        "epochs": 50,  # Increased max epochs
-        "patience": 8,  # Early stopping patience
-        "class_weight_method": "balanced",  # Options: inverse, balanced, effective, capped
-        "mixed_precision": True,  # Enable mixed precision training
-        "clip_grad_norm": 1.0
-    },
-    "data": {
-        "img_size": 256,  # Image size for training
-        "augmentation_prob": 0.5,  # Probability of applying augmentations
-        "parent_dir": "/gws/nopw/j04/iecdt/amorgan/data_copy"
-    },
-    "class_names": ["Background", "Rock", "Glacier", "Ocean&Ice"]
-}
-
-# Loss - Multiclass IoU with gradient stability improvements
-class MultiClassIoULoss(nn.Module):
-    def __init__(self, smooth=1e-5, weights=None):
-        super(MultiClassIoULoss, self).__init__()
-        self.smooth = smooth
-        self.weights = weights  # Class weights tensor
-        
-    def forward(self, y_pred, y_true):
-        # y_pred: [B, C, H, W] - softmax probabilities
-        # y_true: [B, H, W] - class indices
-        
-        # Get number of classes from prediction
-        num_classes = y_pred.shape[1]
-        
-        # Convert target to one-hot if it's not already
-        if len(y_true.shape) == 3:  # [B, H, W]
-            y_true_one_hot = F.one_hot(y_true, num_classes=num_classes).permute(0, 3, 1, 2).float()
-            print(f"y_true_one_hot shape: {y_true_one_hot.shape}")
-        else:  # Assume it's already one-hot [B, C, H, W]
-            y_true_one_hot = y_true
-            
-        # Initialize loss
-        class_iou = []
-        
-        # Calculate IoU for each class
-        for cls in range(num_classes):
-            pred_cls = y_pred[:, cls]  # [B, H, W]
-            true_cls = y_true_one_hot[:, cls]  # [B, H, W]
-            
-            # Calculate intersection and union
-            intersection = torch.sum(pred_cls * true_cls, dim=(1, 2))
-            pred_sum = torch.sum(pred_cls, dim=(1, 2))
-            true_sum = torch.sum(true_cls, dim=(1, 2))
-            union = pred_sum + true_sum - intersection
-            
-            # Calculate batch IoU for this class - use batch mean for stability
-            batch_iou = (intersection + self.smooth) / (union + self.smooth)
-            iou = torch.mean(batch_iou)
-            class_iou.append(iou)
-        
-        # Convert to tensor
-        class_iou = torch.stack(class_iou)
-        
-        # Apply weights if provided
-        if self.weights is not None:
-            weights = self.weights.to(y_pred.device)
-            class_iou = class_iou * weights
-            
-        # Return 1 - mean IoU as the loss
-        return 1 - torch.mean(class_iou)
-
-# Combined loss function for better performance
-class CombinedLoss(nn.Module):
-    def __init__(self, weights=None, dice_weight=0.5, focal_weight=0.5):
-        super(CombinedLoss, self).__init__()
-        self.dice_loss = DiceLoss(
-            include_background=True,
-            to_onehot_y=False,
-            softmax=True,
-            squared_pred=False,
-            smooth_nr=1e-5,
-            smooth_dr=1e-5
-        )
-        self.focal_loss = FocalLoss(
-            include_background=True,
-            to_onehot_y=False,
-            gamma=2.0
-        )
-        self.weights = weights
-        self.dice_weight = dice_weight
-        self.focal_weight = focal_weight
-        
-    def forward(self, y_pred, y_true):
-        # Calculate losses
-        dice_loss = self.dice_loss(y_pred, y_true)
-        focal_loss = self.focal_loss(y_pred, y_true)
-        
-        # Apply class weights if provided
-        if self.weights is not None:
-            weights = self.weights.to(dice_loss.device)
-            dice_loss = dice_loss * weights
-            focal_loss = focal_loss * weights
-            
-        # Calculate weighted sum
-        total_loss = (self.dice_weight * dice_loss.mean() + 
-                      self.focal_weight * focal_loss.mean())
-        
-        return total_loss
-
-# Get loss function based on selection
-def get_loss_function(loss_type="combined", class_weights=None):
-    if loss_type == "dice":
-        return DiceLoss(
-            include_background=True,
-            to_onehot_y=True,
-            softmax=True,
-            squared_pred=False
-        )
-    elif loss_type == "dicece":
-        return DiceCELoss(
-            include_background=True,
-            to_onehot_y=True,
-            softmax=True,
-            lambda_dice=0.5,
-            lambda_ce=0.5
-        )
-    elif loss_type == "iou":
-        return MultiClassIoULoss(weights=class_weights)
-    elif loss_type == "combined":
-        return CombinedLoss(weights=class_weights, dice_weight=0.5, focal_weight=0.5)
-    else:
-        raise ValueError(f"Unsupported loss type: {loss_type}")
-    
-def calculate_metrics(y_true, y_pred, num_classes=4):
-    """
-    Calculate precision, recall, and F1 score for each class.
-    
-    Args:
-        y_true: Ground truth labels (tensor)
-        y_pred: Predicted labels (tensor)
-        num_classes: Number of classes
-        
-    Returns:
-        precision, recall, f1 arrays
-    """
-    # Move tensors to CPU and convert to numpy arrays
-    if torch.is_tensor(y_true):
-        y_true = y_true.detach().cpu().numpy().flatten()
-    if torch.is_tensor(y_pred):
-        y_pred = y_pred.detach().cpu().numpy().flatten()
-    
-    # Initialize arrays to store metrics
-    precision = np.zeros(num_classes)
-    recall = np.zeros(num_classes)
-    f1 = np.zeros(num_classes)
-    
-    # Calculate metrics for each class
-    for cls in range(num_classes):
-        # True positives, false positives, false negatives
-        tp = np.sum((y_true == cls) & (y_pred == cls))
-        fp = np.sum((y_true != cls) & (y_pred == cls))
-        fn = np.sum((y_true == cls) & (y_pred != cls))
-        
-        # Calculate precision, recall, and F1 score
-        precision[cls] = tp / (tp + fp + 1e-8)
-        recall[cls] = tp / (tp + fn + 1e-8)
-        f1[cls] = 2 * precision[cls] * recall[cls] / (precision[cls] + recall[cls] + 1e-8)
-    
-    return precision, recall, f1
-
-# Enhanced visualization function
-def visualize_prediction(image, mask, pred, class_names, sample_info=None):
-    """
-    Create a visualization of the original image, ground truth mask, and predicted mask.
-    Returns a matplotlib figure for logging to wandb.
-    """
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    
-    # Original image - with proper SAR normalization
-    img_display = image.squeeze().cpu().numpy()
-    # Log scale visualization for SAR images (optional)
-    img_display = np.clip(img_display, 0.01, np.percentile(img_display, 99))
-    img_display = 20 * np.log10(img_display)
-    img_display = (img_display - img_display.min()) / (img_display.max() - img_display.min())
-    
-    axes[0].imshow(img_display, cmap='gray')
-    axes[0].set_title('Original SAR Image')
-    axes[0].axis('off')
-    
-    # Define colormap for visualizing masks
-    cmap = plt.cm.get_cmap('viridis', 4)
-    
-    # Ground truth mask
-    axes[1].imshow(mask.cpu().numpy(), cmap=cmap, vmin=0, vmax=3)
-    axes[1].set_title('Ground Truth')
-    axes[1].axis('off')
-    
-    # Predicted mask
-    axes[2].imshow(pred.cpu().numpy(), cmap=cmap, vmin=0, vmax=3)
-    axes[2].set_title('Prediction')
-    axes[2].axis('off')
-    
-    # Add colorbar
-    cbar = fig.colorbar(plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 3)), 
-                       ax=axes, orientation='horizontal', fraction=0.046, pad=0.04)
-    cbar.set_ticks([0.375, 1.125, 1.875, 2.625])
-    cbar.set_ticklabels(class_names)
-    
-    # Add sample info if provided
-    if sample_info:
-        plt.suptitle(f"Sample: {sample_info}", fontsize=14)
-    
-    plt.tight_layout()
-    return fig
-
-def train_one_epoch(model, loader, criterion, optimizer, device, class_names=None, epoch=0, scaler=None):
-    model.train()
-    epoch_loss = 0
-    batch_losses = []
-    print(f"Starting training for epoch {epoch+1}...")
-    
-    # Initialize metrics
-    batch_count = len(loader)
-    all_preds = []
-    all_masks = []
-    # class_iou_totals = torch.zeros(4).to(device)  # For 4 classes
-    # confusion_matrix = torch.zeros((4, 4)).to(device)  # For 4 classes
-
-    # # Initialize precision, recall, and F1 accumulators
-    # precision_totals = torch.zeros(4).to(device)
-    # recall_totals = torch.zeros(4).to(device)
-    # f1_totals = torch.zeros(4).to(device)
-    pbar = tqdm.tqdm(enumerate(loader), total=len(loader))
-    
-    if class_names is None:
-        class_names = CONFIG["class_names"]
-    
-    is_slurm = 'SLURM_JOB_ID' in os.environ
-    # if is_slurm:
-    #     loader_iter = enumerate(loader)
-    #     print(f"Running in SLURM environment. Total batches: {batch_count}")
-
-    # else:
-    #     loader_iter = tqdm.tqdm(enumerate(loader), total=batch_count)
-    
-    vis_interval = max(len(loader) - 1, 1)
-
-    for i, (images, masks) in pbar:
-        images = images.to(device)  # Shape: [batch_size, 1, height, width]
-        masks = masks.to(device).long()  #squeeze 1 was causing issues
-        optimizer.zero_grad()
-        
-        # Mixed precision training if enabled
-        if CONFIG["training"]["mixed_precision"] and scaler is not None:
-            with autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu'):
-                outputs = model(images)
-                loss = criterion(outputs, masks)
-                
-            # Scaled backward pass
-            scaler.scale(loss).backward()
-            
-            # Gradient clipping
-            if CONFIG["training"]["clip_grad_norm"] > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 
-                                              max_norm=CONFIG["training"]["clip_grad_norm"])
-            
-            # Update weights with gradient scaling
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            # Standard training
-            outputs = model(images)
-            masks_one_hot = torch.nn.functional.one_hot(masks, num_classes=4).permute(0, 3, 1, 2)
-            # print("outputs shape:", outputs.shape)
-            # print("masks shape (after forward):", masks.shape)
-            # print("masks unique (after forward):", torch.unique(masks))
-            loss = criterion(outputs, masks_one_hot)
-            loss.backward()
-            if CONFIG["training"]["clip_grad_norm"] > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 
-                                              max_norm=CONFIG["training"]["clip_grad_norm"])
-            optimizer.step()
-        
-        # Record the loss
-        current_loss = loss.item()
-        epoch_loss += current_loss
-        batch_losses.append(current_loss)
-
-        # Accumulate predictions and masks for metrics at the end of the epoch
-        with torch.no_grad():
-            # Get predicted class
-            preds = torch.argmax(outputs, dim=1)  # [batch_size, H, W]
-            # masks_flattened = torch.argmax(masks, dim=1)
-            all_preds.append(preds.cpu())
-            all_masks.append(masks.cpu())
-
-            # batch_precision, batch_recall, batch_f1 = calculate_metrics(masks, preds, num_classes=4)
-            
-            # precision_totals += torch.tensor(batch_precision).to(device)
-            # recall_totals += torch.tensor(batch_recall).to(device)
-            # f1_totals += torch.tensor(batch_f1).to(device)
-
-        # Log batch-level metrics (less frequently to avoid too many logs)
-        if i % 500 == 0:  # Log every 10 batches
-            wandb.log({
-                "batch_loss": current_loss,
-                "batch": i + len(loader) * epoch,
-                "epoch": epoch,
-                "learning_rate": optimizer.param_groups[0]['lr']
-            }) 
-        
-        if i == vis_interval:
-                vis_fig = visualize_prediction(
-                    images[0], 
-                    masks[0],
-                    preds[0], 
-                    class_names,
-                    sample_info=f"Epoch {epoch+1}, Final Batch"
-                )
-                wandb.log({
-                    f"prediction_vis_epoch_{epoch}": wandb.Image(vis_fig),
-                    "epoch": epoch
-                })
-                plt.close(vis_fig)
-        
-        if is_slurm and (i % 500 == 0 or i == batch_count -1):
-                print(f"Epoch {epoch+1} | Batch {i+1}/{batch_count} | Loss: {loss.item():.4f}")
-    
-    
-    all_preds = torch.cat(all_preds, dim=0)
-    all_masks = torch.cat(all_masks, dim=0)
-
-    # Calculate metrics ONCE at the end of the epoch
-    precision, recall, f1 = calculate_metrics(all_masks, all_preds, num_classes=4)
-    # Calculate IoU for each class
-    class_ious = []
-    for cls in range(4):
-        pred_cls = (preds == cls)
-        target_cls = (masks == cls)
-        intersection = (pred_cls & target_cls).sum().float()
-        union = (pred_cls | target_cls).sum().float()
-        iou = intersection / (union + 1e-8)
-        # class_iou_totals[cls] += iou
-        class_ious.append(iou.item())
-    class_ious = np.array(class_ious)
-    mean_iou = class_ious.mean()           
-                # # Update confusion matrix
-                # for true_cls in range(4):
-                #     true_positive = ((masks == true_cls) & (preds == cls)).sum().item()
-                #     confusion_matrix[true_cls, cls] += true_positive
-
-    # # Calculate epoch-level metrics
-    # class_ious = class_iou_totals / batch_count
-    # mean_iou = class_ious.mean().item()
-    
-    # avg_precision = precision_totals / batch_count
-    # avg_recall = recall_totals / batch_count
-    # avg_f1 = f1_totals / batch_count
-    
-    # Plot batch losses within epoch
-    batch_loss_fig = plt.figure(figsize=(10, 5))
-    plt.plot(range(len(batch_losses)), batch_losses)
-    plt.title(f"Batch Losses for Epoch {epoch+1}")
-    plt.xlabel("Batch")
-    plt.ylabel("Loss")
-    plt.grid(True)
-    plt.tight_layout()
-
-    # Log epoch-level metrics
-    metrics = {
-        "train_loss": epoch_loss / len(loader),
-        "mean_iou": mean_iou,
-        "batch_losses": wandb.Image(batch_loss_fig),
-        "mean_precision": precision.mean(),
-        "mean_recall": recall.mean(),
-        "mean_f1": f1.mean(),
-        "epoch": epoch
-    }
-    
-    # Add per-class IoUs
-    for i, class_name in enumerate(class_names):
-        metrics[f"train_iou_{class_name}"] = class_ious[i]
-        metrics[f"train_precision_{class_name}"] = precision[i]
-        metrics[f"train_recall_{class_name}"] = recall[i]
-        metrics[f"train_f1_{class_name}"] = f1[i]
-    
-    wandb.log(metrics)
-    plt.close(batch_loss_fig)
-    plt.close('all')
-    
-    return epoch_loss / len(loader)
-
-def validate(model, loader, criterion, device, class_names=None, epoch=0, scaler=None):
-    model.eval()
-    val_loss = 0
-    vis_batch = len(loader) - 1
-    
-    # Initialize metrics
-    batch_count = len(loader)
-    all_preds = []
-    all_masks = []
-    # class_iou_totals = torch.zeros(4).to(device)
-    # precision_totals = torch.zeros(4).to(device)
-    # recall_totals = torch.zeros(4).to(device)
-    # f1_totals = torch.zeros(4).to(device)
-    # confusion_matrix = torch.zeros((4, 4)).to(device)  # For 4 classes
-    
-    if class_names is None:
-        class_names = CONFIG["class_names"]
-        
-    print(f"Running validation for epoch {epoch+1}...")
-    
-    is_slurm = 'SLURM_JOB_ID' in os.environ
-    if is_slurm:
-        loader_iter = enumerate(loader)
-        total_batches = len(loader)
-            # print(f"Running validation in SLURM environment. Total batches: {total_batches}")
-    else:
-        pbar = tqdm.tqdm(enumerate(loader), total=len(loader))
-        loader_iter = pbar
-
-    with torch.no_grad():
-        for i, (images, masks) in loader_iter:
-            images = images.to(device)
-            masks = masks.to(device).long()
-            
-            outputs = model(images)
-            # loss = criterion(outputs, masks)
-            masks_one_hot = torch.nn.functional.one_hot(masks, num_classes=4).permute(0, 3, 1, 2)
-            loss = criterion(outputs, masks_one_hot)
-            val_loss += loss.item()
-            
-            # Get predicted class
-            preds = torch.argmax(outputs, dim=1)
-            all_preds.append(preds.cpu())
-            all_masks.append(masks.cpu())
-            
-            # Calculate metrics for this batch
-            # batch_precision, batch_recall, batch_f1 = calculate_metrics(masks, preds, num_classes=4)
-            # precision_totals += torch.tensor(batch_precision).to(device)
-            # recall_totals += torch.tensor(batch_recall).to(device)
-            # f1_totals += torch.tensor(batch_f1).to(device)
-            
-            # Visualize some predictions
-            if i == vis_batch:
-                sample_idx = 0
-                vis_fig = visualize_prediction(
-                    images[sample_idx],
-                    masks[sample_idx],
-                    preds[sample_idx],
-                    class_names,
-                    sample_info=f"Validation - Epoch {epoch+1}, Final"
-                )
-                wandb.log({
-                    f"val_pred_epoch_{epoch}": wandb.Image(vis_fig),
-                    "epoch": epoch
-                })
-                plt.close(vis_fig)
-            if is_slurm and i % 10 == 0:
-                print(f"Validation Epoch {epoch+1} | Batch {i}/{total_batches} | Loss: {loss.item():.4f}")
-    
-    all_preds = torch.cat(all_preds, dim=0)
-    all_masks = torch.cat(all_masks, dim=0)
-    precision, recall, f1 = calculate_metrics(all_masks, all_preds, num_classes=4)
-    class_ious = []
-    # Calculate average metrics
-    # avg_val_loss = val_loss / batch_count
-    # class_ious = class_iou_totals / batch_count
-    # mean_iou = class_ious.mean().item()
-    
-    # avg_precision = precision_totals / batch_count
-    # avg_recall = recall_totals / batch_count
-    # avg_f1 = f1_totals / batch_count
-
-    # Calculate IoU for each class
-    for cls in range(4):
-        pred_cls = (preds == cls)
-        target_cls = (masks == cls)
-        intersection = (pred_cls & target_cls).sum().float()
-        union = (pred_cls | target_cls).sum().float()
-        iou = intersection / (union + 1e-8)
-        class_ious.append(iou.item())
-    class_ious = np.array(class_ious)
-    mean_iou = class_ious.mean()
-    avg_val_loss = val_loss / batch_count
-
-                # for true_cls in range(4):
-                #     true_positive = ((masks == true_cls) & (preds == cls)).sum().item()
-                #     confusion_matrix[true_cls, cls] += true_positive
-    
-# Code for plotting confusion matrix
-
-    # conf_matrix_fig = plt.figure(figsize=(10, 8))
-    # conf_matrix_np = confusion_matrix.cpu().numpy()
-    # plt.imshow(conf_matrix_np, cmap='Blues')
-    # plt.colorbar()
-    # plt.title('Validation Confusion Matrix')
-    # plt.xlabel('Predicted')
-    # plt.ylabel('True')
-    # plt.xticks(range(4), class_names, rotation=45)
-    # plt.yticks(range(4), class_names)
-    
-    # # Add text annotations to the confusion matrix
-    # for i in range(4):
-    #     for j in range(4):
-    #         # Normalize by row (true class)
-    #         row_sum = conf_matrix_np[i].sum()
-    #         percentage = (conf_matrix_np[i, j] / row_sum) * 100 if row_sum > 0 else 0
-    #         plt.text(j, i, f'{percentage:.1f}%', ha='center', va='center', 
-    #                  color='white' if conf_matrix_np[i, j] > conf_matrix_np.max() / 2 else 'black')
-    
-    plt.tight_layout()
-
-    # Log validation metrics
-    metrics = {
-        "val_loss": avg_val_loss,
-        "val_mean_iou": mean_iou,
-        "val_mean_precision": precision.mean(),
-        "val_mean_recall": recall.mean(),
-        "val_mean_f1": f1.mean(),
-        # "val_confusion_matrix": wandb.Image(conf_matrix_fig),
-        "epoch": epoch
-    }
-    
-    # # Add per-class metrics
-    for i, class_name in enumerate(class_names):
-        metrics[f"val_iou_{class_name}"] = class_ious[i]
-        metrics[f"val_precision_{class_name}"] = precision[i]
-        metrics[f"val_recall_{class_name}"] = recall[i]
-        metrics[f"val_f1_{class_name}"] = f1[i]
-    
-    wandb.log(metrics)
-    # plt.close(conf_matrix_fig)
-    plt.close('all')
-    
-    return avg_val_loss, mean_iou
-
-def calculate_class_weights(dataset, max_samples=500, method='balanced'):
-    print("Calculating class weights...")
+def calculate_class_weights(dataset, max_samples=500, method="balanced"):
+    log.info("Calculating class weights...")
     class_counts = torch.zeros(4)
-    
+
     # Use a subset of the dataset for efficiency
     sample_count = min(max_samples, len(dataset))
     indices = torch.randperm(len(dataset))[:sample_count]
-    
+
     for idx in tqdm.tqdm(indices):
         _, mask = dataset[idx]
         if torch.is_tensor(mask):
@@ -598,227 +82,295 @@ def calculate_class_weights(dataset, max_samples=500, method='balanced'):
                 mask_indices = torch.argmax(mask, axis=0)
             else:
                 mask_indices = mask.squeeze()
-            
+
             # Count pixels per class
             for cls in range(4):
                 class_counts[cls] += torch.sum(mask_indices == cls).item()
 
     total_pixels = class_counts.sum()
     class_freq = class_counts / total_pixels
-    print(f"Class frequencies: {class_freq}")
-    
-    if method == 'inverse':
+    log.info(f"Class frequencies: {class_freq}")
+
+    if method == "inverse":
         # Original method - inverse frequency (can be extreme)
         class_weights = 1.0 / (class_freq + 1e-8)
-        
-    elif method == 'balanced':
+
+    elif method == "balanced":
         # Balanced method - more moderate weights
         class_weights = 1.0 / (torch.sqrt(class_freq) + 1e-8)
-        
-    elif method == 'effective':
+
+    elif method == "effective":
         # Effective number of samples (better for extreme imbalance)
         # From "Class-Balanced Loss Based on Effective Number of Samples"
         beta = 0.9999
         effective_num = 1.0 - torch.pow(beta, class_counts)
         class_weights = (1.0 - beta) / (effective_num + 1e-8)
-        
-    elif method == 'capped':
+
+    elif method == "capped":
         # Capped inverse frequency with maximum ratio limit
         max_ratio = 5.0  # Maximum weight ratio between classes
         class_weights = 1.0 / (class_freq + 1e-8)
         max_weight = torch.max(class_weights)
         min_weight = torch.min(class_weights)
-        
+
         if max_weight / min_weight > max_ratio:
             # Scale down the highest weights
             class_weights = torch.where(
                 class_weights > max_ratio * min_weight,
                 max_ratio * min_weight,
-                class_weights
+                class_weights,
             )
-    
+
     # Normalize weights so they sum to number of classes
     class_weights = class_weights / class_weights.sum() * len(class_weights)
-    print(f"Class weights: {class_weights}")
+    log.info(f"Class weights: {class_weights}")
     return class_weights
 
-def main():
-    # Initialize W&B
+
+""" 
+HYDRA IMPLEMENTATION
+"""
+log = logging.getLogger(__name__)
+
+
+@hydra.main(
+    version_base=None, config_path="conf", config_name="config"
+)  # TODO: could change to train and test
+def main(cfg: DictConfig):  # before was def main():  ## NOT COMPLETED YET
+
+    print("MAIN FUNCTION STARTED")
+    print("Config keys:", list(cfg.keys()))
+    print("Training config:", cfg.training)
+    print("Model config:", cfg.model)
+
+    # ALL NEW HYDRA STUFF
+    set_seed(cfg["seed"])
+
+    # if cfg.use_wandb:
+    #     wandb.init(
+    #         project=cfg.name,
+    #         config=OmegaConf.to_container(cfg, resolve=True),
+    #         name=cfg.name
+    #     )
+    print("seed set")
     wandb.init(
+
+        #usual slurm setup!
         project="CAFFE",
         name="seg_improved_glacier",
         entity="amy-morgan-university-of-oxford",
-        settings=wandb.Settings(
-        start_method="thread"),
+        settings=wandb.Settings(start_method="thread"),
         job_type="training",
         save_code=False,
-        config=CONFIG
+        #config=cfg, 
+        config=OmegaConf.to_container(cfg, resolve=True), 
+      
+        # config=cfg#OmegaConf.to_container(cfg, resolve=True),
+
+
+
+        # for wandb hyperparameter sweeps
+        #config = wandb.config
     )
-    
-    class_names = CONFIG["class_names"]
-    parent_dir = CONFIG["data"]["parent_dir"]
+#debug
+    # print(config)
+
+    print("wandb init done")
+
+    class_names = cfg["class_names"]
+    parent_dir = cfg["data"]["parent_dir"]
     filtered_csv_path = os.path.join(parent_dir, "train_cleaned_patches.csv")
 
-    #save the models to gws
-    save_dir = "/gws/nopw/j04/iecdt/amorgan/trained_models"
-    os.makedirs(save_dir, exist_ok=True)
+    # save the models to gws
+    os.makedirs(cfg["save_dir"], exist_ok=True)
 
     # Load datasets
-    train_dataset = GlacierSegDataset(mode='train', parent_dir=parent_dir, label_type="mask",filtered_csv_path=filtered_csv_path)
-    val_dataset = GlacierSegDataset(mode='val', parent_dir=parent_dir, label_type="mask")
-    class_weights = calculate_class_weights(train_dataset, method=CONFIG["training"]["class_weight_method"])
-   
+    train_dataset = GlacierSegDataset(
+        mode="train",
+        parent_dir=parent_dir,
+        label_type="mask",
+        filtered_csv_path=filtered_csv_path,
+    )
+    val_dataset = GlacierSegDataset(
+        mode="val", parent_dir=parent_dir, label_type="mask"
+    )
+    class_weights = calculate_class_weights(
+        train_dataset, method=cfg["training"]["class_weight_method"]
+    )
+    print(f"Class weights: {class_weights}")
 
     # Create data loaders
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=CONFIG["training"]["batch_size"], 
+        train_dataset,
+        batch_size=cfg["training"]["batch_size"],
         shuffle=True,
-        num_workers=8,
+        num_workers=cfg["num_workers"],
         pin_memory=True,
-        persistent_workers=True
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=CONFIG["training"]["batch_size"],
-        shuffle=False,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True
+        # persistent_workers=True,
     )
 
-    # # Visualize class weights
-    # plt.figure(figsize=(10, 5))
-    # plt.bar(class_names, class_weights.numpy())
-    # plt.title("Class Weights")
-    # plt.ylabel("Weight Value")
-    # plt.tight_layout()
-    # wandb.log({"class_weights": wandb.Image(plt)})
-    # plt.close()
-    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg["training"]["batch_size"],
+        shuffle=False,
+        num_workers=cfg["num_workers"],
+        pin_memory=True,
+        # persistent_workers=True,
+    )
+
+    log.info("After DataLoader creation")
+
+    # TODO: Load trained model if the weights exist
+    # Add batch size to the model name
+    model_name_prefix = f"{cfg["name"]}_bs{cfg['training']['batch_size']}"
+    best_model_loss_path = os.path.join(
+        cfg["save_dir"], f"{model_name_prefix}_best_loss.pth"
+    )
+    best_model_iou_path = os.path.join(
+        cfg["save_dir"], f"{model_name_prefix}_best_iou.pth"
+    )
+    checkpoint_path = os.path.join(
+        cfg["save_dir"], f"{model_name_prefix}_latest_epoch.pth"
+    )
+
     # Create model
     model = smp.Unet(
-        encoder_name=CONFIG["model"]["encoder_name"],
-        encoder_weights=CONFIG["model"]["encoder_weights"],
-        in_channels=CONFIG["model"]["in_channels"],
-        classes=CONFIG["model"]["classes"]
+        encoder_name=cfg["model"]["encoder_name"],
+        encoder_weights=cfg["model"]["encoder_weights"],
+        in_channels=cfg["model"]["in_channels"],
+        classes=cfg["model"]["classes"],
     )
-    
+
     # Set up device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     model.to(device)
-    
-    if torch.is_tensor(class_weights):
-        class_weights = class_weights.to(device)
-    
-    # Loss function and optimizer
-    criterion = get_loss_function("combined", class_weights)
+    log.info(f"Using device: {device}")
+    log.info(print_gpu_usage("After model.to(device)"))
     optimizer = optim.AdamW(
-        model.parameters(), 
-        lr=CONFIG["training"]["learning_rate"], 
-        weight_decay=CONFIG["training"]["weight_decay"]
+        model.parameters(),
+        lr=cfg["training"]["learning_rate"],
+        weight_decay=cfg["training"]["weight_decay"],
     )
-    
+
     # Learning rate scheduler - cosine annealing with warm restarts
     scheduler = CosineAnnealingWarmRestarts(
         optimizer,
         T_0=10,  # Restart every 10 epochs
         T_mult=1,  # Multiply period by 1 (no change) after each restart
-        eta_min=1e-6  # Minimum learning rate
+        eta_min=1e-6,  # Minimum learning rate
     )
-    patience_counter = 0
-    best_val_loss = float('inf')
+
+    # Check if a model load path is specified and exists
+    # We also need to load the optimizer and scheduler to continue training
+    if cfg["load_path"] and os.path.exists(checkpoint_path):
+        log.info(f"Loading model weights from {checkpoint_path}")
+        checkpoint = torch.load(
+            checkpoint_path, map_location=device, weights_only=False
+        )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        log.info("Model weights loaded successfully.")
+        print("Model weights loaded successfully.")
+    else:
+        log.info(
+            "No valid load_path specified or file does not exist. Training from scratch."
+        )
+
+    if torch.is_tensor(class_weights):
+        class_weights = class_weights.to(device)
+
+    # Loss function and optimizer
+    criterion = get_loss_function("combined", class_weights)
+    best_val_loss = float("inf")
     best_val_iou = 0.0
-    best_epoch = -1
 
-    # Add batch size to the model name
-    model_name_prefix = f"seg_model_bs{CONFIG['training']['batch_size']}"
+    for epoch in range(cfg["training"]["epochs"]):
 
-    for epoch in range(CONFIG["training"]["epochs"]):
+        log.info(print_gpu_usage(f"Start of epoch {epoch}"))
         # Train one epoch
         train_loss = train_one_epoch(
-            model, 
-            train_loader, 
-            criterion, 
-            optimizer, 
-            device, 
-            class_names=class_names,
-            epoch=epoch
-        )
-        val_loss, val_iou = validate(
             model,
-            val_loader,
+            train_loader,
             criterion,
+            optimizer,
             device,
-            class_names=class_names,
-            epoch=epoch)
-        
+            cfg,  # used to be class_names
+            log,
+            epoch=epoch,
+        )
+        log.info(print_gpu_usage(f"After train_one_epoch {epoch}"))
+        val_loss, val_iou = validate(
+            model, val_loader, criterion, device, cfg, log, epoch=epoch
+        )
+        log.info(print_gpu_usage(f"After validate {epoch}"))
         # Update scheduler
         scheduler.step()
-        if CONFIG.get("use_wandb", False):
-            wandb.log({
-                "train_loss": train_loss,
-                "epoch": epoch
-            })
-        
+        if cfg.get("use_wandb", False):
+            wandb.log({"train_loss": train_loss, "epoch": epoch})
+
+        if val_loss > best_val_loss:
+            best_val_loss = val_loss
+            # Save model checkpoint with more information
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": (
+                        scheduler.state_dict() if scheduler else None
+                    ),
+                    "val_loss": val_loss,
+                    "val_iou": val_iou,
+                    "config": cfg,
+                },
+                best_model_loss_path,
+            )
+
         if val_iou > best_val_iou:
             best_val_iou = val_iou
-            best_val_loss = val_loss
-            best_epoch = epoch
-            best_model_path = os.path.join(save_dir, f"{model_name_prefix}_best.pth")
-            
-            # Save model checkpoint with more information
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                'val_loss': val_loss,
-                'val_iou': val_iou,
-                'config': CONFIG
-            }, best_model_path)
-            
-            print(f"New best model saved at epoch {epoch+1} with val IoU: {val_iou:.4f} and val loss: {val_loss:.4f}")
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            print(f"No improvement for {patience_counter} epochs. Best val IoU: {best_val_iou:.4f} at epoch {best_epoch+1}")
-        
-        # Check for early stopping
-        if patience_counter >= CONFIG["training"]["patience"]:
-            print(f"Early stopping triggered after {epoch+1} epochs!")
-            break
 
-        if epoch % 50 == 0:
-            checkpoint_path = os.path.join(save_dir, f"{model_name_prefix}_epoch_{epoch}.pth")
-            torch.save(model.state_dict(), checkpoint_path)
-    
-        # Always save latest model with batch size in the name
-        latest_model_path = os.path.join(save_dir, f"{model_name_prefix}_latest.pth")
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'val_loss': val_loss,
-            'val_iou': val_iou,
-            'config': CONFIG
-        }, latest_model_path)
+            # Save model checkpoint with more information
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": (
+                        scheduler.state_dict() if scheduler else None
+                    ),
+                    "val_loss": val_loss,
+                    "val_iou": val_iou,
+                    "config": cfg,
+                },
+                best_model_iou_path,
+            )
+
+        if epoch % cfg.save_freq == 0:
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": (
+                        scheduler.state_dict() if scheduler else None
+                    ),
+                    "val_loss": val_loss,
+                    "val_iou": val_iou,
+                    "config": cfg,
+                },
+                checkpoint_path,
+            )
 
         # Clear memory
         torch.cuda.empty_cache()
         gc.collect()
+        log.info(print_gpu_usage(f"After empty_cache/collect {epoch}"))
 
-       # Final evaluation on validation set using best model
+    # Final evaluation on validation set using best model
     print(f"\n{'='*20} Final Evaluation {'='*20}")
-    print(f"Loading best model from epoch {best_epoch+1}")
-    
-    # Load the best model
-    checkpoint = torch.load(best_model_path)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
+
     # Final validation
     final_val_loss, final_val_iou = validate(
         model,
@@ -826,206 +378,111 @@ def main():
         criterion,
         device,
         class_names=class_names,
-        epoch=CONFIG["training"]["epochs"]  # Just for logging purposes
+        epoch=cfg["training"]["epochs"],  # Just for logging purposes
     )
-    
+
     # Log final results
     final_metrics = {
         "final_val_loss": final_val_loss,
         "final_val_iou": final_val_iou,
-        "best_epoch": best_epoch + 1,
         "best_val_loss": best_val_loss,
         "best_val_iou": best_val_iou,
-        "total_epochs_trained": epoch + 1
+        "total_epochs_trained": epoch + 1,
     }
     wandb.log(final_metrics)
-    
+
     # Print summary
     print("\nTraining Summary:")
     print(f"Total epochs trained: {epoch + 1}")
-    print(f"Best model at epoch {best_epoch + 1}")
     print(f"Best validation IoU: {best_val_iou:.4f}")
     print(f"Best validation loss: {best_val_loss:.4f}")
     print(f"Final validation IoU: {final_val_iou:.4f}")
     print(f"Final validation loss: {final_val_loss:.4f}")
-    print(f"Best model saved at: {best_model_path}")
-        
-    wandb.finish()
-   
-   
-def inference(model_path, image_path, device=None):
-    """
-    Run inference on a single image using a trained model.
-    
-    Args:
-        model_path: Path to the trained model checkpoint
-        image_path: Path to the input image
-        device: Device to run inference on ('cuda' or 'cpu')
-    
-    Returns:
-        prediction: Segmentation mask (numpy array)
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Load model
-    checkpoint = torch.load(model_path, map_location=device)
-    config = checkpoint['config']
-    
-    model = smp.Unet(
-        encoder_name=config["model"]["encoder_name"],
-        encoder_weights=None,  # Don't load pretrained weights
-        in_channels=config["model"]["in_channels"],
-        classes=config["model"]["classes"]
-    )
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
-    model.eval()
-    
-    # Load and preprocess image
-    image = Image.open(image_path).convert('L')  # Convert to grayscale
-    image = np.array(image)
-    
-    # Resize to match model's expected input size
-    img_size = config["data"]["img_size"]
-    image = cv2.resize(image, (img_size, img_size))
-    
-    # Normalize and convert to tensor
-    image = image.astype(np.float32) / 255.0
-    image = torch.from_numpy(image).unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
-    image = image.to(device)
-    
-    # Run inference
-    with torch.no_grad():
-        output = model(image)
-        prediction = torch.argmax(output, dim=1).squeeze().cpu().numpy()
-    
-    return prediction
 
-def visualize_inference(image_path, prediction, class_names=None):
-    """
-    Visualize inference results.
-    
-    Args:
-        image_path: Path to the original image
-        prediction: Predicted segmentation mask (numpy array)
-        class_names: List of class names
-    
-    Returns:
-        fig: Matplotlib figure
-    """
-    if class_names is None:
-        class_names = CONFIG["class_names"]
-    
-    # Load original image
-    image = Image.open(image_path).convert('L')
-    image = np.array(image)
-    
-    # Resize original image to match prediction size
-    image = cv2.resize(image, (prediction.shape[1], prediction.shape[0]))
-    
-    # Create figure
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    
-    # Display original image
-    axes[0].imshow(image, cmap='gray')
-    axes[0].set_title('Original Image')
-    axes[0].axis('off')
-    
-    # Display prediction
-    cmap = plt.cm.get_cmap('viridis', len(class_names))
-    im = axes[1].imshow(prediction, cmap=cmap, vmin=0, vmax=len(class_names)-1)
-    axes[1].set_title('Segmentation Prediction')
-    axes[1].axis('off')
-    
-    # Add colorbar
-    cbar = fig.colorbar(im, ax=axes[1], orientation='vertical', fraction=0.046, pad=0.04)
-    cbar.set_ticks(np.arange(len(class_names)) + 0.5)
-    cbar.set_ticklabels(class_names)
-    
-    plt.tight_layout()
-    return fig
+    wandb.finish()
+
 
 def evaluate_model(model_path, dataset, device=None):
     """
     Evaluate model on a dataset.
-    
+
     Args:
         model_path: Path to the trained model checkpoint
         dataset: Dataset to evaluate on
         device: Device to run evaluation on ('cuda' or 'cpu')
-    
+
     Returns:
         metrics: Dictionary of evaluation metrics
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     # Load model
     checkpoint = torch.load(model_path, map_location=device)
-    config = checkpoint['config']
-    
+    config = checkpoint["config"]
+
     model = smp.Unet(
         encoder_name=config["model"]["encoder_name"],
         encoder_weights=None,
         in_channels=config["model"]["in_channels"],
-        classes=config["model"]["classes"]
+        classes=config["model"]["classes"],
     )
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
+
+    model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
-    
+
     # Setup data loader
     dataloader = DataLoader(
         dataset,
         batch_size=config["training"]["batch_size"],
         shuffle=False,
-        num_workers=4
+        num_workers=config["num_workers"],
     )
-    
+
     # Initialize metrics
     num_classes = config["model"]["classes"]
     class_iou_totals = torch.zeros(num_classes).to(device)
     precision_totals = torch.zeros(num_classes).to(device)
     recall_totals = torch.zeros(num_classes).to(device)
     f1_totals = torch.zeros(num_classes).to(device)
-    
+
     # Run evaluation
     with torch.no_grad():
         for images, masks in tqdm.tqdm(dataloader):
             images = images.to(device)
             masks = masks.to(device).long()
-            
+
             outputs = model(images)
             preds = torch.argmax(outputs, dim=1)
-            
+
             # Calculate metrics
-            batch_precision, batch_recall, batch_f1 = calculate_metrics(masks, preds, num_classes=num_classes)
+            batch_precision, batch_recall, batch_f1 = calculate_metrics(
+                masks, preds, num_classes=num_classes
+            )
             precision_totals += torch.tensor(batch_precision).to(device)
             recall_totals += torch.tensor(batch_recall).to(device)
             f1_totals += torch.tensor(batch_f1).to(device)
-            
+
             # Calculate IoU for each class
             for cls in range(num_classes):
-                pred_cls = (preds == cls)
-                target_cls = (masks == cls)
-                
+                pred_cls = preds == cls
+                target_cls = masks == cls
+
                 intersection = (pred_cls & target_cls).sum().float()
                 union = (pred_cls | target_cls).sum().float()
-                
+
                 iou = intersection / (union + 1e-8)
                 class_iou_totals[cls] += iou
-    
+
     # Calculate final metrics
     class_ious = class_iou_totals / len(dataloader)
     mean_iou = class_ious.mean().item()
-    
+
     avg_precision = precision_totals / len(dataloader)
     avg_recall = recall_totals / len(dataloader)
     avg_f1 = f1_totals / len(dataloader)
-    
+
     # Create metrics dictionary
     metrics = {
         "mean_iou": mean_iou,
@@ -1035,12 +492,20 @@ def evaluate_model(model_path, dataset, device=None):
         "mean_f1": avg_f1.mean().item(),
         "precision_per_class": avg_precision.cpu().numpy(),
         "recall_per_class": avg_recall.cpu().numpy(),
-        "f1_per_class": avg_f1.cpu().numpy()
+        "f1_per_class": avg_f1.cpu().numpy(),
     }
-    
+
     return metrics
 
 
 # Main execution entry point
 if __name__ == "__main__":
+    import pickle
+    import cloudpickle
+    # Test pickling of main function
+    try:
+        cloudpickle.dumps(main)
+        print("Main function is picklable")
+    except Exception as e:
+        print(f"Main function pickling failed: {e}")
     main()

@@ -1,0 +1,56 @@
+#base configuration
+
+defaults:
+  - _self_
+  - hydra: default
+  - override hydra/launcher: slurm
+
+# Main configuration
+seed: 0
+name: "seg_glacier"
+save_dir: "/gws/nopw/j04/iecdt/amorgan/trained_models"
+data_root: "/gws/nopw/j04/iecdt/amorgan/data_copy"
+load_path: true
+use_wandb: true
+class_names: ["Background", "Rock", "Glacier", "Ocean_Ice"]
+log_freq: 200
+save_freq: 1
+num_workers: 4
+device: "cuda"
+
+
+# model/unet_resnet50_baseline.yaml
+model:
+  encoder_name: "resnet50"
+  encoder_weights: "imagenet"
+  in_channels: 1
+  classes: 4
+
+
+# training/default.yaml
+training:
+  batch_size: 4
+  learning_rate: 1e-4
+  weight_decay: 1e-4
+  epochs: 50
+  class_weight_method: "balanced"
+  mixed_precision: true
+  clip_grad_norm: 1.0
+  gradient_accumulation_steps: 1
+
+# training/bs8.yaml
+# batch_size: 8
+# learning_rate: 1e-4
+# weight_decay: 1e-4
+# epochs: 50
+# patience: 8
+# class_weight_method: "balanced"
+# mixed_precision: true
+# clip_grad_norm: 1.0
+# gradient_accumulation_steps: 1
+
+# data/glacier_seg.yaml
+data:
+  img_size: 256
+  augmentation_prob: 0.5
+  parent_dir: "/gws/nopw/j04/iecdt/amorgan/data_copy"
