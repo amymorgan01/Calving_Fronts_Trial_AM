@@ -12,5 +12,12 @@ Changes/
 old_runs/
 results/
 wandb/
-segmentation_model_epoch_0.pth
-segmentation_model_latest.pth
+train_the_model.py
+logs/
+train.py
+validate_or_test.py
+utils_AM.py
+pickle_test.py
+models/
+see as we go.ipynb
+Amy_data_checker.ipynb
