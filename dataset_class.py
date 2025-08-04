@@ -67,11 +67,10 @@ class GlacierSegDataset(Dataset):
         self.transform = A.Compose([
             A.RandomRotate90(p=0.5),
             A.HorizontalFlip(p=0.5),
-            A.RandomResizedCrop(size=(256, 256), scale=(0.8, 1.0), p=1.0),
-            # A.OneOf([
-            #     A.GaussNoise(p=0.5),
-            #     A.RandomBrightnessContrast(p=0.5),
-            # ], p=0.3),
+            A.RandomResizedCrop(size=(256, 256), scale=(0.8, 1.0), p=0.5),
+            A.RandomBrightnessContrast(p=0.1),
+            A.GaussNoise(std_range=(0.1, 0.2), p=0.5),
+
         ])
         
         # Separate normalization for image only (after joint transformations)
